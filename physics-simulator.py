@@ -1,39 +1,3 @@
-"""
-Physics Simulator - 2D Particles with Gravity, Elastic Collisions, and Interactive Cursor Controls (Pyodide-compatible)
-
-How to run in browser (Pyodide):
-- Launch this script with: python physics_simulator.py
-- The simulation will prompt for number of sides (0=circle, 3+=polygon) before starting.
-- Spacebar: pause/resume. 'R': reset with new random initial conditions.
-- Interactive controls: Click to create particles, drag to move them, hold keys for special modes
-
-Note: All interactions are in-browser; no file/network operations.
-
-===========================================================================================
-EDUCATIONAL NOTES:
-------------------
-This Python file implements a real-time, interactive 2D particle physics simulation using:
-- Pygame for rendering and event handling
-- Numpy for vector arithmetic and performance
-- Asyncio for frame timing and Pyodide/browser compatibility
-- Interactive cursor controls for real-time particle manipulation
-
-PHYSICS MODELED:
-- Each "particle" is a rigid body (either a circle or regular polygon by user choice)
-- Particles move under constant gravity (downward acceleration)
-- Elastic collisions (conservation of momentum and kinetic energy) between particles, and between particle and walls
-- Interactive cursor forces (gravity wells, repulsion fields)
-- All particles are same size/mass for simplicity (configurable via mouse wheel)
-
-UI INTERACTION:
-- User sets particle shape (number of sides) at the start
-- Controls: Spacebar to pause/resume; R to reset simulation; H to show/hide help
-- Mouse: Left-click to create particles, right-click drag for velocity, wheel for size
-- Special modes: G+mouse for gravity well, R+mouse for repulsion, Shift+drag to throw particles
-
-===========================================================================================
-"""
-
 import sys
 import random
 import math
@@ -51,9 +15,21 @@ WIDTH, HEIGHT = 600, 400         # Canvas dimensions in pixels
 FPS = 60                         # Frames per second (simulation step rate)
 G = 9.8                          # Gravity acceleration (pixels/s^2, applied downward/y+)
 RADIUS = 10                      # Default radius of bounding circle for each particle (pixels)
-MASS = 1                         # Mass per particle (arbitrary units, all equal)
+# Mass is now calculated dynamically based on material and size
 PARTICLE_COUNT = 5               # Initial number of particles in the simulation
 MAX_PARTICLES = 50               # Maximum allowed particles
+
+# New: Material Properties
+# Density in mass/pixel^2, restitution (bounciness) from 0.0 to 1.0
+MATERIALS = {
+    'ROCK':    {'density': 0.6, 'restitution': 0.4, 'color': (136, 140, 141)},
+    'WOOD':    {'density': 0.3, 'restitution': 0.6, 'color': (139, 69, 19)},
+    'STEEL':   {'density': 0.9, 'restitution': 0.7, 'color': (192, 192, 192)},
+    'RUBBER':  {'density': 0.4, 'restitution': 0.9, 'color': (60, 60, 60)},
+    'ICE':     {'density': 0.2, 'restitution': 0.5, 'color': (173, 216, 230)},
+}
+MATERIAL_TYPES = list(MATERIALS.keys())
+
 
 # Cursor interaction constants
 CURSOR_FORCE_RADIUS = 100        # Radius of cursor force effects
@@ -110,21 +86,29 @@ class Particle:
     Attributes:
         pos:    [x, y] position (float, center of mass)
         vel:    [vx, vy] velocity (float, pixels/sec)
-        mass:   mass of particle (constant)
+        mass:   mass of particle (calculated from material density and size)
         radius: bounding radius (collision approximation)
         color:  RGB tuple
         sides:  0=circle, N>=3 => N-sided regular polygon
+        material: String key for MATERIAL properties
+        restitution: bounciness
         selected: boolean indicating if particle is selected
         trail: list of recent positions for trail effect
     """
 
-    def __init__(self, pos, vel, color, sides, radius=RADIUS):
+    def __init__(self, pos, vel, sides, material='STEEL', radius=RADIUS):
         self.pos = np.array(pos, dtype='float64')     # [x, y] position vector
         self.vel = np.array(vel, dtype='float64')     # [vx, vy] velocity vector
-        self.mass = MASS                              # All particles the same mass
         self.radius = radius                          # Collision and rendering radius
-        self.color = color                            # For rendering
         self.sides = sides                            # 0 = circle, 3+ = polygon
+        self.material = material
+        
+        material_props = MATERIALS[material]
+        self.restitution = material_props['restitution']
+        self.color = material_props['color']
+        # Mass = density * Area (approximated by circle area)
+        self.mass = material_props['density'] * math.pi * (self.radius ** 2)
+        
         self.selected = False                         # Selection state for interactions
         self.trail = []                               # Trail of recent positions
         self.max_trail_length = 20                    # Maximum trail length
@@ -243,7 +227,14 @@ class CursorSystem:
         self.velocity_start = None
         self.current_particle_radius = RADIUS
         self.force_mode = None  # 'gravity', 'repulsion', or None
+        self.current_material_index = 0
         
+    def get_current_material(self):
+        return MATERIAL_TYPES[self.current_material_index]
+    
+    def cycle_material(self):
+        self.current_material_index = (self.current_material_index + 1) % len(MATERIAL_TYPES)
+
     def update_mouse_pos(self, pos):
         """Update current mouse position"""
         self.mouse_pos = pos
@@ -275,9 +266,8 @@ class CursorSystem:
             else:
                 # Create new particle at click position
                 if len(particles) < MAX_PARTICLES:
-                    colors = color_sequence(len(particles) + 1)
-                    new_color = colors[len(particles)]
-                    new_particle = Particle(pos, [0, 0], new_color, sides, self.current_particle_radius)
+                    material = self.get_current_material()
+                    new_particle = Particle(pos, [0, 0], sides, material, self.current_particle_radius)
                     particles.append(new_particle)
         
         elif button == 3:  # Right click
@@ -408,58 +398,80 @@ class CursorSystem:
 
 def elastic_collision(p1: Particle, p2: Particle):
     """
-    Perform a perfectly elastic collision between two particles (equal mass).
+    Handles collision between two particles with varying mass and restitution.
 
-    Updates their velocities based on momentum and energy conservation:
-        - Approximates all shapes with their bounding circles for collision purposes
-        - Standard vector elastic collision for 2 particles of equal mass
-
-    Formula Reference:
-        See https://en.wikipedia.org/wiki/Elastic_collision#Two-dimensional
-
-    Math:
-        Let n = (p1.pos - p2.pos)  # vector from p2 to p1
-        Let v_rel = p1.vel - p2.vel
-        Velocity update (equal mass, 2D):
-            p1.vel -= (dot(v_rel, n) / |n|^2) * n
-            p2.vel += (dot(v_rel, n) / |n|^2) * n
-
-    Notes:
-        - If impact_factor > 0, particles are moving away, so skip updating (no collision on separation)
-        - If centers overlap, small random n is chosen to avoid div by zero
+    Updates velocities based on conservation of momentum and the coefficient of restitution.
+    This is now an inelastic collision model if restitution < 1.
     """
-    # Vector difference between centers
-    delta_pos = p1.pos - p2.pos
-    dist_sqr = np.dot(delta_pos, delta_pos)
-    if dist_sqr == 0:
-        # Overlapping: randomize separation direction to avoid numerical instability
-        delta_pos = np.random.rand(2) - 0.5
-        dist_sqr = np.dot(delta_pos, delta_pos)
-    delta_vel = p1.vel - p2.vel
-    impact_factor = np.dot(delta_vel, delta_pos) / dist_sqr
-    if impact_factor > 0:
-        # Particles moving away; no collision
+    # Vector from p1 to p2
+    delta_pos = p2.pos - p1.pos
+    dist = np.linalg.norm(delta_pos)
+
+    # If particles are overlapping, move them apart to avoid sticking
+    if dist == 0: dist = 1e-6 # avoid division by zero
+    
+    overlap = p1.radius + p2.radius - dist
+    if overlap > 0:
+        # Push apart proportional to mass
+        m1, m2 = p1.mass, p2.mass
+        total_mass = m1 + m2
+        p1.pos -= (delta_pos / dist) * (overlap * (m2 / total_mass))
+        p2.pos += (delta_pos / dist) * (overlap * (m1 / total_mass))
+        # Recalculate for accuracy after separation
+        delta_pos = p2.pos - p1.pos
+        dist = np.linalg.norm(delta_pos)
+
+    # Normal vector (unit vector along line of centers)
+    normal = delta_pos / dist if dist != 0 else np.array([1.0, 0.0])
+    
+    # Tangent vector
+    tangent = np.array([-normal[1], normal[0]])
+
+    # Project velocities onto normal and tangent vectors
+    v1n_scalar = np.dot(p1.vel, normal)
+    v1t_scalar = np.dot(p1.vel, tangent)
+    v2n_scalar = np.dot(p2.vel, normal)
+    v2t_scalar = np.dot(p2.vel, tangent)
+
+    # Particles are moving away from each other along the normal, no collision
+    if v1n_scalar > v2n_scalar:
         return
 
-    # Update velocities using conservation of momentum + energy
-    p1.vel -= impact_factor * delta_pos
-    p2.vel += impact_factor * delta_pos
+    # Coefficient of restitution (use the average of the two particles)
+    e = (p1.restitution + p2.restitution) / 2.0
+
+    # New normal velocities after collision (1D collision formula)
+    m1, m2 = p1.mass, p2.mass
+    total_mass = m1 + m2
+    v1n_new_scalar = (m1 * v1n_scalar + m2 * v2n_scalar + m2 * e * (v2n_scalar - v1n_scalar)) / total_mass
+    v2n_new_scalar = (m1 * v1n_scalar + m2 * v2n_scalar + m1 * e * (v1n_scalar - v2n_scalar)) / total_mass
+
+    # Convert scalar normal velocities back to vectors
+    v1n_vec_new = v1n_new_scalar * normal
+    v2n_vec_new = v2n_new_scalar * normal
+
+    # Tangential velocities remain unchanged, convert back to vectors
+    v1t_vec = v1t_scalar * tangent
+    v2t_vec = v2t_scalar * tangent
+
+    # Final velocities are sum of new normal and old tangential velocities
+    p1.vel = v1n_vec_new + v1t_vec
+    p2.vel = v2n_vec_new + v2t_vec
+
 
 def check_particle_boundary(p: Particle):
     """
-    Handles elastic collision of particle with simulation boundaries (canvas walls).
-        - If a coordinate exceeds left/right or top/bottom, reflect it
-        - Sets position to be just inside boundary, reverses velocity component
+    Handles collision of particle with simulation boundaries, applying restitution.
     """
     for i, limit in enumerate((WIDTH, HEIGHT)):  # i=0 (x-axis), i=1 (y-axis)
         if p.pos[i] - p.radius < 0:
             # Left or Top wall
             p.pos[i] = p.radius
-            p.vel[i] = abs(p.vel[i])  # Ensure particle bounces inward
+            p.vel[i] = abs(p.vel[i]) * p.restitution  # Apply restitution
         elif p.pos[i] + p.radius > limit:
             # Right or Bottom wall
             p.pos[i] = limit - p.radius
-            p.vel[i] = -abs(p.vel[i]) # Reflect velocity back into area
+            p.vel[i] = -abs(p.vel[i]) * p.restitution # Apply restitution
 
 
 # =========================================
@@ -566,11 +578,10 @@ async def main():
     # ---- PARTICLE STATE: INITIALIZATION ----
     def random_state():
         """
-        Generates list of Particle objects with random initial positions/velocities.
+        Generates list of Particle objects with random initial positions/velocities/materials.
         Ensures no two particles overlap at spawn.
         """
         particles = []
-        colors = color_sequence(PARTICLE_COUNT)
         for i in range(PARTICLE_COUNT):
             while True:
                 pos = np.array([
@@ -584,8 +595,8 @@ async def main():
                 random.uniform(-50, 50),   # vx in pixels/sec
                 random.uniform(-50, 50)    # vy in pixels/sec
             ])
-            # Each particle gets unique color and same polygon spec
-            particles.append(Particle(pos, vel, colors[i], sides))
+            material = random.choice(MATERIAL_TYPES)
+            particles.append(Particle(pos, vel, sides, material))
         return particles
 
     initial_particles = random_state()
@@ -593,7 +604,7 @@ async def main():
     running = True
     paused = False
     # Deepcopy state for reset
-    particles = [Particle(np.copy(p.pos), np.copy(p.vel), p.color, p.sides, p.radius) for p in initial_particles]
+    particles = [Particle(np.copy(p.pos), np.copy(p.vel), p.sides, p.material, p.radius) for p in initial_particles]
     show_help = True
 
     while running:
@@ -605,15 +616,18 @@ async def main():
                 # Space: Pause/resume
                 if event.key == pygame.K_SPACE:
                     paused = not paused
-                # R: Reset simulation
-                elif event.key in (pygame.K_r, pygame.K_R):
-                    if not pygame.key.get_pressed()[pygame.K_r]:  # Only if R key for reset, not repulsion
+                # R: Reset simulation (check that we are not in repulsion mode)
+                elif event.key == pygame.K_r and not pygame.key.get_pressed()[pygame.K_g]:
+                    if cursor_system.force_mode != 'repulsion':
                         initial_particles = random_state()
-                        particles = [Particle(np.copy(p.pos), np.copy(p.vel), p.color, p.sides, p.radius) for p in initial_particles]
+                        particles = [Particle(np.copy(p.pos), np.copy(p.vel), p.sides, p.material, p.radius) for p in initial_particles]
                         paused = False
                 # H: Toggle help
-                elif event.key in (pygame.K_h, pygame.K_H):
+                elif event.key == pygame.K_h:
                     show_help = not show_help
+                # M: Cycle material
+                elif event.key == pygame.K_m:
+                    cursor_system.cycle_material()
             
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 cursor_system.handle_mouse_down(event.pos, event.button, particles, sides)
@@ -652,14 +666,8 @@ async def main():
                 for j in range(i+1, len(particles)):
                     p1, p2 = particles[i], particles[j]
                     # Approximate all shapes as circles for collision math
-                    delta = p1.pos - p2.pos
-                    dist = np.linalg.norm(delta)
-                    if dist < p1.radius + p2.radius:
-                        # Overlap detected: push apart slightly to prevent sticking
-                        overlap = (p1.radius + p2.radius) - dist + 0.1
-                        direction = delta / (dist if dist!=0 else 1)
-                        p1.pos += direction * (overlap/2)
-                        p2.pos -= direction * (overlap/2)
+                    dist_sq = np.dot(p1.pos - p2.pos, p1.pos - p2.pos)
+                    if dist_sq < (p1.radius + p2.radius)**2:
                         elastic_collision(p1, p2)
 
         # ---- RENDERING ----
@@ -673,7 +681,8 @@ async def main():
         cursor_system.draw_cursor_effects(screen)
 
         # ---- INFO OVERLAYS / INSTRUCTIONS ----
-        status_text = f"{'Paused' if paused else 'Running'} | Particles: {len(particles)}/{MAX_PARTICLES} | Radius: {cursor_system.current_particle_radius}"
+        current_material = cursor_system.get_current_material()
+        status_text = f"{'Paused' if paused else 'Running'} | Particles: {len(particles)}/{MAX_PARTICLES} | Material: {current_material}"
         if cursor_system.force_mode:
             status_text += f" | Mode: {cursor_system.force_mode.upper()}"
         
@@ -687,10 +696,11 @@ async def main():
 
         if show_help:
             help_lines = [
-                "Interactive 2D Physics Simulator",
-                f"Shape: {'Circle' if sides==0 else f'{sides}-gon'} | Physics: Gravity + Elastic Collisions",
+                "Interactive 2D Physics Simulator - Realism Update",
+                f"Shape: {'Circle' if sides==0 else f'{sides}-gon'} | Physics: Gravity + Inelastic Collisions",
                 "Controls:",
                 "  Space: pause/resume   R: reset   H: hide/show help",
+                "  M: cycle material (for new particles)",
                 "  Left click: create particle or drag to move",
                 "  Right drag: set velocity   Wheel: adjust size",
                 "  G + mouse: gravity well   R + mouse: repulsion",
